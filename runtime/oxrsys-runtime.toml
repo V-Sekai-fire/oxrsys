@@ -12,7 +12,7 @@
 runtime_enabled = true
 
 [streaming]
-# H.265 encoding bitrate in Mbps. Lower = less latency but more artifacts.
+# PyroWave encoding bitrate in Mbps; each frame is held to bitrate_mbps / refresh_rate_hz bytes. Lower = less latency but more artifacts.
 # Try 20-30 for lower latency, 50+ for quality.
 bitrate_mbps = 50
 
@@ -37,10 +37,6 @@ keyframe_interval_sec = 2
 # balanced = default, good mix
 # quality  = best visual quality, slightly higher latency
 encoder_preset = "balanced"
-
-# Video codec on macOS: "h265" (VideoToolbox) or "pyrowave" (intra-only wavelet
-# codec in Metal compute, every frame held to bitrate_mbps / refresh_rate_hz bytes).
-codec = "h265"
 
 # Streaming transport: "auto" tries USB ADB reverse and WiFi, "wifi" disables USB TCP
 # listeners, and "usb_adb" disables WiFi discovery fallback.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-// PyroWaveDecoder.swift — Decodes the runtime's PyroWave frames (streaming.codec = "pyrowave")
-// on the GPU into the same NV12 video-range pixel buffers H265Decoder hands the renderer.
+// PyroWaveDecoder.swift — Decodes the runtime's PyroWave frames on the GPU into the
+// NV12 video-range pixel buffers StereoRenderer draws.
 
 import CoreMedia
 import CoreVideo
@@ -10,7 +10,7 @@ import Foundation
 import Metal
 
 public final class PyroWaveDecoder: @unchecked Sendable {
-    public typealias OnFrame = H265Decoder.OnFrame
+    public typealias OnFrame = @Sendable (CVPixelBuffer, CMTime) -> Void
 
     private let lock = NSLock()
     private var onFrame: OnFrame?

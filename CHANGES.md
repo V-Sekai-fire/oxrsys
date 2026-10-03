@@ -27,10 +27,12 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added a native USB ADB backend to SwiftUI Home so Quest USB reverse setup can run without Android Studio, the Android SDK, Homebrew, or an `adb` executable.
 - Added world-space (rotational) reprojection to the visionOS viewer: each streamed frame is reprojected from the head pose the runtime rendered it for into the live head pose every vsync, so the view stays locked to the world as the head turns instead of lagging the stream. It reuses the per-frame `VIDEO_FLAG_RENDER_POSE` the runtime already sends and is client-only (no runtime, protocol, or other-client changes).
 
-- Added PyroWave as an optional macOS streaming codec (`streaming.codec = "pyrowave"`): an intra-only wavelet encoder in Metal compute with exact per-frame rate control, `VideoCodec::PyroWave` on the wire, a matching decoder in the Apple simulator, and a round-trip test with corrupted- and truncated-frame controls.
+- Added PyroWave as a macOS streaming codec: an intra-only wavelet encoder in Metal compute with exact per-frame rate control, `VideoCodec::PyroWave` on the wire, a matching decoder in the Apple simulator, and a round-trip test with corrupted- and truncated-frame controls.
+- Added a macOS CI workflow that builds and tests the runtime, builds and tests the Apple Swift packages, and builds the Home, simulator and visionOS apps unsigned.
 
 ### Changed
 
+- Changed the macOS runtime to stream only PyroWave: the H.265 compression session and the `streaming.codec` setting are removed. The visionOS viewer and the Apple simulator decode only PyroWave, `ClientConnect` asks for it, and the VideoToolbox H.265 decoder is deleted. Configuring with `-DOXRSYS_BUILD_QT_FRONTENDS=ON` on Apple platforms now fails, since the Qt simulator's PyroWave decoder uses the Vulkan C API that Apple builds do not compile.
 - Changed the Windows and Linux streaming encoder to PyroWave's Vulkan C API (MIT, fetched with FetchContent with its Granite subset and linked statically). Nothing links FFmpeg; frames are intra-only and tagged `VideoCodec::PyroWave`. The Linux encoder sends a black frame until it reads the app's swapchain images.
 - Changed the Qt simulator to drop frames only when their packets are lost: parity trailing a delivered frame no longer counts as a drop or asks for a keyframe, and the video socket's receive buffer is set after bind, where it takes effect.
 - Moved the repository toward the OXRSys cross-platform layout, including `clients/Android/android-vr/`, `clients/Apple/common/`, and `clients/Qt/`.

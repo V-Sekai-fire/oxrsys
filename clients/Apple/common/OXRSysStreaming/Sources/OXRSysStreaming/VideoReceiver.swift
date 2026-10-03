@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-// VideoReceiver.swift — Receives H.265 video packets on UDP 9944,
+// VideoReceiver.swift — Receives PyroWave video packets on UDP 9944,
 // reassembles fragmented NAL units, delivers complete frames.
 //
 // Hot path uses raw memory (UnsafeMutablePointer) to avoid Swift Data COW overhead

@@ -677,7 +677,7 @@ struct ContentView: View {
                         RuntimeStatsMetric(
                             title: "Encoded",
                             value: dimensions(width: latest.encodedWidth, height: latest.encodedHeight),
-                            subtitle: "H.265 stream",
+                            subtitle: "PyroWave stream",
                             systemImage: "rectangle.compress.vertical",
                             color: .purple
                         )

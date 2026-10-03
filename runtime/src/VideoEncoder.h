@@ -83,14 +83,13 @@ public:
     // Force a keyframe on the next encode
     void ForceKeyframe();
 
-    // Update encoding bitrate mid-stream (VideoToolbox supports this live)
+    // Update encoding bitrate mid-stream; the next frame's byte budget follows it
     void SetBitrate(uint32_t bitrateMbps);
     uint32_t GetBitrateMbps() const { return bitrateMbps_; }
 
     bool IsInitialized() const
     {
-        return videoToolbox_.session != nullptr || pyrowave_.encoder != nullptr ||
-               win32_ != nullptr;
+        return pyrowave_.encoder != nullptr || win32_ != nullptr;
     }
 
     // Stats
@@ -116,9 +115,8 @@ private:
     void ReleaseSlot(size_t slotIndex);
     void DestroySlots();
 
-    struct VideoToolboxState
+    struct MetalState
     {
-        void* session = nullptr;          // VTCompressionSessionRef
         void* pixelBufferPool = nullptr;  // CVPixelBufferPoolRef
         void* textureCache = nullptr;     // CVMetalTextureCacheRef
         void* metalDevice = nullptr;      // id<MTLDevice>
@@ -142,7 +140,7 @@ private:
     void EncodePyroWave(void* pixelBuffer, void* context);
 
     GraphicsContext graphicsContext_ = {};
-    VideoToolboxState videoToolbox_ = {};
+    MetalState metal_ = {};
     PyroWaveState pyrowave_ = {};
     void* win32_ = nullptr;           // Win32PyroWaveState* (PyroWaveVideoEncoder.cpp)
 

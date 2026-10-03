@@ -210,7 +210,7 @@ public struct ClientConnect: Sendable {
     public var versionMajor: UInt8 = 1
     public var versionMinor: UInt8 = 0
     public var reserved: UInt8 = 0
-    public var preferredCodec: UInt32 = 0 // H265
+    public var preferredCodec: UInt32 = VideoCodec.pyroWave.rawValue
     public var maxBitrateMbps: UInt32 = OXRProtocol.clientMaxBitrateUseServerConfig
     public var refreshRateHz: UInt32 = 0
     public var deviceName: (

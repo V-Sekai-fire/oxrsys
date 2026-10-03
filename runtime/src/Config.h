@@ -14,14 +14,13 @@
 struct ConfigValues
 {
     bool runtimeEnabled = true;     // Allow this runtime to accept xrCreateInstance
-    uint32_t bitrateMbps = 50;      // H.265 encoding bitrate in Mbps
+    uint32_t bitrateMbps = 50;      // PyroWave encoding bitrate in Mbps
     uint32_t fovDegrees = 100;      // Legacy fallback FOV when a client omits eyeFov
     uint32_t refreshRateHz = 72;    // Preferred headset refresh rate
     float resolutionScale = 0.75f;  // Encode resolution multiplier (0.25-1.0)
     float dynamicResolutionMinScale = 0.50f; // Lowest ABR full-mode encode scale
     uint32_t keyframeIntervalSec = 2; // Seconds between forced keyframes
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
-    std::string videoCodec = "h265"; // macOS: "h265" or "pyrowave"
     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
     std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "high"
     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"

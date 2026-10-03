@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #import "VideoEncoder.h"
-#import "Config.h"
 
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -159,105 +158,6 @@ void FinalizeEncodeFrame(EncodeFrameContext* context, bool frameDropped)
     delete context;
 }
 
-bool IsKeyframeSample(CMSampleBufferRef sampleBuffer)
-{
-    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
-    if (attachments == nullptr || CFArrayGetCount(attachments) == 0)
-    {
-        return true;
-    }
-
-    CFDictionaryRef dict = (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-    CFBooleanRef notSync = nullptr;
-    if (!CFDictionaryGetValueIfPresent(dict, kCMSampleAttachmentKey_NotSync, (const void**)&notSync))
-    {
-        return true;
-    }
-
-    return !CFBooleanGetValue(notSync);
-}
-
-void EmitSampleNalUnits(CMSampleBufferRef sampleBuffer, bool isKeyframe,
-                        const VideoEncoder::OnNalUnitCallback& callback)
-{
-    if (!callback)
-    {
-        return;
-    }
-
-    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    int64_t timestampNs = (int64_t)(CMTimeGetSeconds(pts) * 1e9);
-
-    if (isKeyframe)
-    {
-        CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-        if (formatDesc != nullptr)
-        {
-            size_t paramSetCount = 0;
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                formatDesc, 0, nullptr, nullptr, &paramSetCount, nullptr);
-
-            for (size_t i = 0; i < paramSetCount; i++)
-            {
-                const uint8_t* paramSet = nullptr;
-                size_t paramSetSize = 0;
-                OSStatus status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                    formatDesc, i, &paramSet, &paramSetSize, nullptr, nullptr);
-                if (status != noErr || paramSet == nullptr || paramSetSize == 0)
-                {
-                    continue;
-                }
-
-                std::vector<uint8_t> nalUnit(4 + paramSetSize);
-                nalUnit[0] = 0x00;
-                nalUnit[1] = 0x00;
-                nalUnit[2] = 0x00;
-                nalUnit[3] = 0x01;
-                memcpy(nalUnit.data() + 4, paramSet, paramSetSize);
-                callback(nalUnit.data(), nalUnit.size(), true, timestampNs);
-            }
-        }
-    }
-
-    CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    if (dataBuffer == nullptr)
-    {
-        return;
-    }
-
-    size_t totalLength = 0;
-    char* dataPointer = nullptr;
-    if (CMBlockBufferGetDataPointer(dataBuffer, 0, nullptr, &totalLength, &dataPointer) != noErr ||
-        dataPointer == nullptr || totalLength == 0)
-    {
-        return;
-    }
-
-    size_t offset = 0;
-    while (offset + 4 <= totalLength)
-    {
-        uint32_t naluLength = 0;
-        memcpy(&naluLength, dataPointer + offset, 4);
-        naluLength = CFSwapInt32BigToHost(naluLength);
-        offset += 4;
-
-        if (naluLength == 0 || offset + naluLength > totalLength)
-        {
-            break;
-        }
-
-        std::vector<uint8_t> nalUnit(4 + naluLength);
-        nalUnit[0] = 0x00;
-        nalUnit[1] = 0x00;
-        nalUnit[2] = 0x00;
-        nalUnit[3] = 0x01;
-        memcpy(nalUnit.data() + 4, dataPointer + offset, naluLength);
-
-        callback(nalUnit.data(), nalUnit.size(), isKeyframe, timestampNs);
-        offset += naluLength;
-    }
-}
-
 void EncodeWaitForFrameImage(id<MTLCommandBuffer> commandBuffer, const FrameImageSource& source)
 {
     if (commandBuffer == nil ||
@@ -362,45 +262,6 @@ id<MTLSamplerState> CreateLinearClampSampler(id<MTLDevice> device)
 
 } // namespace
 
-static void CompressionOutputCallback(void* /*outputCallbackRefCon*/,
-                                       void* sourceFrameRefCon,
-                                       OSStatus status,
-                                       VTEncodeInfoFlags infoFlags,
-                                       CMSampleBufferRef sampleBuffer)
-{
-    auto* context = static_cast<EncodeFrameContext*>(sourceFrameRefCon);
-    if (context == nullptr)
-    {
-        return;
-    }
-
-    if (status != noErr || sampleBuffer == nullptr || (infoFlags & kVTEncodeInfo_FrameDropped))
-    {
-        FinalizeEncodeFrame(context, true);
-        return;
-    }
-
-    bool isKeyframe = IsKeyframeSample(sampleBuffer);
-    context->metrics.keyframe = isKeyframe;
-    try
-    {
-        EmitSampleNalUnits(sampleBuffer, isKeyframe, context->nalCallback);
-    }
-    catch (const std::exception& error)
-    {
-        spdlog::warn("VideoEncoder: NAL callback threw: {}", error.what());
-        FinalizeEncodeFrame(context, true);
-        return;
-    }
-    catch (...)
-    {
-        spdlog::warn("VideoEncoder: NAL callback threw an unknown exception");
-        FinalizeEncodeFrame(context, true);
-        return;
-    }
-    FinalizeEncodeFrame(context, false);
-}
-
 VideoEncoder::VideoEncoder() = default;
 
 VideoEncoder::~VideoEncoder()
@@ -408,12 +269,10 @@ VideoEncoder::~VideoEncoder()
     Shutdown();
 }
 
-// The codec the live encoder produces; StreamingServer stamps it on every packet.
-static std::atomic<uint32_t> g_streamCodec{static_cast<uint32_t>(oxr::protocol::VideoCodec::H265)};
-
+// Every macOS frame is PyroWave; StreamingServer stamps this on every packet.
 oxr::protocol::VideoCodec VideoEncoder::StreamCodec()
 {
-    return static_cast<oxr::protocol::VideoCodec>(g_streamCodec.load());
+    return oxr::protocol::VideoCodec::PyroWave;
 }
 
 bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& graphicsContext)
@@ -443,7 +302,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     fps_ = fps;
     bitrateMbps_ = bitrateMbps;
     graphicsContext_ = graphicsContext;
-    videoToolbox_.metalDevice = graphicsContext.metalDevice;
+    metal_.metalDevice = graphicsContext.metalDevice;
     shuttingDown_.store(false);
     foveationValidationWarningLogged_.store(false);
     droppedFrameCount_.store(0);
@@ -458,13 +317,13 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         return false;
     }
 
-    videoToolbox_.commandQueue = (void*)[device newCommandQueue];
-    videoToolbox_.scaler = (void*)[[MPSImageBilinearScale alloc] initWithDevice:device];
+    metal_.commandQueue = (void*)[device newCommandQueue];
+    metal_.scaler = (void*)[[MPSImageBilinearScale alloc] initWithDevice:device];
     if (foveationSettings_.enabled)
     {
-        videoToolbox_.foveationPipeline = (void*)CreateFoveationPipeline(device);
-        videoToolbox_.foveationSampler = (void*)CreateLinearClampSampler(device);
-        if (videoToolbox_.foveationPipeline == nullptr || videoToolbox_.foveationSampler == nullptr)
+        metal_.foveationPipeline = (void*)CreateFoveationPipeline(device);
+        metal_.foveationSampler = (void*)CreateLinearClampSampler(device);
+        if (metal_.foveationPipeline == nullptr || metal_.foveationSampler == nullptr)
         {
             spdlog::error("VideoEncoder: Foveated encoding was negotiated but the shader is unavailable");
             Shutdown();
@@ -480,7 +339,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         spdlog::error("VideoEncoder: Failed to create Metal texture cache: {}", cvResult);
         return false;
     }
-    videoToolbox_.textureCache = cache;
+    metal_.textureCache = cache;
 
     NSDictionary* poolConfig = @{
         (NSString*)kCVPixelBufferPoolMinimumBufferCountKey: @(SlotCount),
@@ -505,7 +364,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         Shutdown();
         return false;
     }
-    videoToolbox_.pixelBufferPool = pool;
+    metal_.pixelBufferPool = pool;
 
     MTLTextureDescriptor* tmpDesc = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -531,7 +390,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     {
         CVPixelBufferRef pixelBuffer = nullptr;
         cvResult = CVPixelBufferPoolCreatePixelBuffer(
-            kCFAllocatorDefault, (CVPixelBufferPoolRef)videoToolbox_.pixelBufferPool, &pixelBuffer);
+            kCFAllocatorDefault, (CVPixelBufferPoolRef)metal_.pixelBufferPool, &pixelBuffer);
         if (cvResult != kCVReturnSuccess || pixelBuffer == nullptr)
         {
             spdlog::error("VideoEncoder: Failed to preallocate pixel buffer slot {}", i);
@@ -542,7 +401,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         CVMetalTextureRef cvMetalTexture = nullptr;
         cvResult = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault,
-            (CVMetalTextureCacheRef)videoToolbox_.textureCache,
+            (CVMetalTextureCacheRef)metal_.textureCache,
             pixelBuffer,
             nullptr,
             MTLPixelFormatBGRA8Unorm,
@@ -576,112 +435,13 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         slots_[i].inUse = false;
     }
 
-    if (Config::Get().GetValues().videoCodec == "pyrowave")
+    if (!InitializePyroWave(graphicsContext))
     {
-        if (!InitializePyroWave(graphicsContext))
-        {
-            Shutdown();
-            return false;
-        }
-        g_streamCodec.store(static_cast<uint32_t>(oxr::protocol::VideoCodec::PyroWave));
-        spdlog::info("VideoEncoder: Initialized PyroWave encoder {}x{} @ {}fps, {}Mbps ({} bytes per frame, slots={})",
-                      width, height, fps, bitrateMbps, bitrateMbps * 1000000u / 8u / std::max(fps, 1u), SlotCount);
-        return true;
-    }
-    g_streamCodec.store(static_cast<uint32_t>(oxr::protocol::VideoCodec::H265));
-
-    NSDictionary* encoderSpec = @{
-        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
-        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
-    };
-
-    VTCompressionSessionRef compressionSession = nullptr;
-    OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault,
-        width,
-        height,
-        kCMVideoCodecType_HEVC,
-        (__bridge CFDictionaryRef)encoderSpec,
-        nullptr,
-        kCFAllocatorDefault,
-        CompressionOutputCallback,
-        nullptr,
-        &compressionSession);
-    if (status != noErr)
-    {
-        spdlog::error("VideoEncoder: Failed to create compression session: {}", status);
         Shutdown();
         return false;
     }
-
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-
-    const ConfigValues config = Config::Get().GetValues();
-    const std::string& preset = config.encoderPreset;
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_ProfileLevel,
-        kVTProfileLevel_HEVC_Main_AutoLevel);
-    if (preset == "speed")
-    {
-        VTSessionSetProperty(compressionSession,
-            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
-        spdlog::info("VideoEncoder: Using 'speed' preset (prioritize speed)");
-    }
-    else if (preset == "quality")
-    {
-        VTSessionSetProperty(compressionSession,
-            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanFalse);
-        spdlog::info("VideoEncoder: Using 'quality' preset");
-    }
-    else
-    {
-        spdlog::info("VideoEncoder: Using 'balanced' preset");
-    }
-
-    int avgBitrate = bitrateMbps * 1000000;
-    CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &avgBitrate);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
-    CFRelease(bitrateRef);
-
-    double peakBytesPerSecond = (double)(bitrateMbps * 1000000) * 1.5 / 8.0;
-    NSArray* dataRateLimits = @[@(peakBytesPerSecond), @(1.0)];
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)dataRateLimits);
-
-    uint32_t keyframeIntervalSec = config.keyframeIntervalSec;
-    int keyframeInterval = keyframeIntervalSec * std::max(fps, 1u);
-    CFNumberRef intervalRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &keyframeInterval);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_MaxKeyFrameInterval, intervalRef);
-    CFRelease(intervalRef);
-
-    double keyframeDuration = (double)keyframeIntervalSec;
-    CFNumberRef durationRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat64Type, &keyframeDuration);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, durationRef);
-    CFRelease(durationRef);
-
-    int expectedFps = std::max(fps, 1u);
-    CFNumberRef fpsRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &expectedFps);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_ExpectedFrameRate, fpsRef);
-    CFRelease(fpsRef);
-
-    int maxFrameDelay = 0;
-    CFNumberRef delayRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &maxFrameDelay);
-    VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_MaxFrameDelayCount, delayRef);
-    CFRelease(delayRef);
-
-    VTCompressionSessionPrepareToEncodeFrames(compressionSession);
-    videoToolbox_.session = compressionSession;
-
-    spdlog::info("VideoEncoder: Initialized H.265 encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
-                  width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
+    spdlog::info("VideoEncoder: Initialized PyroWave encoder {}x{} @ {}fps, {}Mbps ({} bytes per frame, slots={})",
+                  width, height, fps, bitrateMbps, bitrateMbps * 1000000u / 8u / std::max(fps, 1u), SlotCount);
     return true;
 }
 
@@ -821,15 +581,6 @@ void VideoEncoder::Shutdown()
 {
     shuttingDown_.store(true);
 
-    if (videoToolbox_.session != nullptr)
-    {
-        VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
-        VTCompressionSessionCompleteFrames(compressionSession, kCMTimeInvalid);
-        VTCompressionSessionInvalidate(compressionSession);
-        CFRelease(compressionSession);
-        videoToolbox_.session = nullptr;
-    }
-
     for (int i = 0; i < 200 && inFlightFrameCount_.load() > 0; i++)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -862,35 +613,35 @@ void VideoEncoder::Shutdown()
         }
     }
 
-    if (videoToolbox_.scaler != nullptr)
+    if (metal_.scaler != nullptr)
     {
-        [(MPSImageBilinearScale*)videoToolbox_.scaler release];
-        videoToolbox_.scaler = nullptr;
+        [(MPSImageBilinearScale*)metal_.scaler release];
+        metal_.scaler = nullptr;
     }
-    if (videoToolbox_.foveationPipeline != nullptr)
+    if (metal_.foveationPipeline != nullptr)
     {
-        [(id<MTLComputePipelineState>)videoToolbox_.foveationPipeline release];
-        videoToolbox_.foveationPipeline = nullptr;
+        [(id<MTLComputePipelineState>)metal_.foveationPipeline release];
+        metal_.foveationPipeline = nullptr;
     }
-    if (videoToolbox_.foveationSampler != nullptr)
+    if (metal_.foveationSampler != nullptr)
     {
-        [(id<MTLSamplerState>)videoToolbox_.foveationSampler release];
-        videoToolbox_.foveationSampler = nullptr;
+        [(id<MTLSamplerState>)metal_.foveationSampler release];
+        metal_.foveationSampler = nullptr;
     }
-    if (videoToolbox_.commandQueue != nullptr)
+    if (metal_.commandQueue != nullptr)
     {
-        [(id<MTLCommandQueue>)videoToolbox_.commandQueue release];
-        videoToolbox_.commandQueue = nullptr;
+        [(id<MTLCommandQueue>)metal_.commandQueue release];
+        metal_.commandQueue = nullptr;
     }
-    if (videoToolbox_.pixelBufferPool != nullptr)
+    if (metal_.pixelBufferPool != nullptr)
     {
-        CFRelease(videoToolbox_.pixelBufferPool);
-        videoToolbox_.pixelBufferPool = nullptr;
+        CFRelease(metal_.pixelBufferPool);
+        metal_.pixelBufferPool = nullptr;
     }
-    if (videoToolbox_.textureCache != nullptr)
+    if (metal_.textureCache != nullptr)
     {
-        CFRelease(videoToolbox_.textureCache);
-        videoToolbox_.textureCache = nullptr;
+        CFRelease(metal_.textureCache);
+        metal_.textureCache = nullptr;
     }
 
     spdlog::info("VideoEncoder: Shut down (submitted={} dropped={})",
@@ -917,7 +668,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                                    int64_t timestampNs, OnNalUnitCallback callback,
                                    OnFrameEncodedCallback frameCallback)
 {
-    if ((videoToolbox_.session == nullptr && pyrowave_.encoder == nullptr) ||
+    if (pyrowave_.encoder == nullptr ||
         !frameSource.left.IsValid() ||
         (stereo && !frameSource.right.IsValid()))
     {
@@ -976,7 +727,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         return dropAcquiredSlot("missing source texture");
     }
 
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)videoToolbox_.commandQueue;
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal_.commandQueue;
     if (queue == nil)
     {
         ReleaseSlot(slotIndex);
@@ -998,8 +749,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     bool forceKeyframe = forceKeyframe_.exchange(false);
     const bool useFoveatedEncoding = stereo &&
         foveationSettings_.enabled &&
-        videoToolbox_.foveationPipeline != nullptr &&
-        videoToolbox_.foveationSampler != nullptr &&
+        metal_.foveationPipeline != nullptr &&
+        metal_.foveationSampler != nullptr &&
         slot.foveatedScratchTexture != nullptr;
     bool needsDownscale = stereo
         ? (leftTex.width != (NSUInteger)eyeWidth_ || leftTex.height != (NSUInteger)height_ ||
@@ -1060,12 +811,12 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
             return dropAcquiredSlot("failed to create foveated compute encoder");
         }
         id<MTLComputePipelineState> pipeline =
-            (id<MTLComputePipelineState>)videoToolbox_.foveationPipeline;
+            (id<MTLComputePipelineState>)metal_.foveationPipeline;
         [computeEncoder setComputePipelineState:pipeline];
         [computeEncoder setTexture:leftTex atIndex:0];
         [computeEncoder setTexture:rightTex atIndex:1];
         [computeEncoder setTexture:foveatedDstTexture atIndex:2];
-        [computeEncoder setSamplerState:(id<MTLSamplerState>)videoToolbox_.foveationSampler
+        [computeEncoder setSamplerState:(id<MTLSamplerState>)metal_.foveationSampler
                                 atIndex:0];
         [computeEncoder setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
 
@@ -1101,7 +852,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     {
         id<MTLTexture> tmpLeft = (id<MTLTexture>)slot.tmpLeftTexture;
         id<MTLTexture> tmpRight = (id<MTLTexture>)slot.tmpRightTexture;
-        MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
+        MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)metal_.scaler;
         [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:tmpLeft];
         [scaler encodeToCommandBuffer:cmdBuf sourceTexture:rightTex destinationTexture:tmpRight];
 
@@ -1156,7 +907,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     }
     else if (needsDownscale)
     {
-        MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
+        MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)metal_.scaler;
         [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:dstTexture];
     }
     else
@@ -1190,7 +941,6 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     context->encodeStart = Clock::now();
     context->encodeSubmitFinished = context->encodeStart;
 
-    VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
     [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer)
     {
         if (commandBuffer.status != MTLCommandBufferStatusCompleted || this->shuttingDown_.load())
@@ -1200,45 +950,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         }
 
         context->metrics.gpuCopyMs = ToMilliseconds(Clock::now() - context->encodeStart);
-
-        if (this->pyrowave_.encoder != nullptr)
-        {
-            this->EncodePyroWave(pixelBuffer, context);
-            return;
-        }
-
-        CFMutableDictionaryRef frameProps = nullptr;
-        if (forceKeyframe)
-        {
-            frameProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 1,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            CFDictionarySetValue(frameProps,
-                kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue);
-        }
-
-        CMTime presentationTime = CMTimeMake(timestampNs, 1000000000);
-        auto submitStart = Clock::now();
-        OSStatus status = VTCompressionSessionEncodeFrame(
-            compressionSession,
-            pixelBuffer,
-            presentationTime,
-            kCMTimeInvalid,
-            frameProps,
-            context,
-            nullptr);
-        context->metrics.encodeSubmitMs = ToMilliseconds(Clock::now() - submitStart);
-        context->encodeSubmitFinished = Clock::now();
-
-        if (frameProps != nullptr)
-        {
-            CFRelease(frameProps);
-        }
-
-        if (status != noErr)
-        {
-            spdlog::warn("VideoEncoder: VTCompressionSessionEncodeFrame failed: {}", status);
-            FinalizeEncodeFrame(context, true);
-        }
+        this->EncodePyroWave(pixelBuffer, context);
     }];
 
     [cmdBuf commit];
@@ -1325,31 +1037,6 @@ void VideoEncoder::ForceKeyframe()
 
 void VideoEncoder::SetBitrate(uint32_t bitrateMbps)
 {
-    if (videoToolbox_.session == nullptr || bitrateMbps == bitrateMbps_)
-    {
-        return;
-    }
-
-    VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
-
-    int avgBitrate = bitrateMbps * 1000000;
-    CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &avgBitrate);
-    OSStatus status = VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
-    CFRelease(bitrateRef);
-
-    if (status == noErr)
-    {
-        double peakBytesPerSecond = (double)(bitrateMbps * 1000000) * 1.5 / 8.0;
-        NSArray* dataRateLimits = @[@(peakBytesPerSecond), @(1.0)];
-        VTSessionSetProperty(compressionSession,
-            kVTCompressionPropertyKey_DataRateLimits, (__bridge CFArrayRef)dataRateLimits);
-
-        spdlog::info("VideoEncoder: Bitrate changed {} -> {} Mbps", bitrateMbps_, bitrateMbps);
-        bitrateMbps_ = bitrateMbps;
-    }
-    else
-    {
-        spdlog::warn("VideoEncoder: Failed to set bitrate to {} Mbps: {}", bitrateMbps, status);
-    }
+    std::lock_guard<std::mutex> lock(pyrowaveMutex_);
+    bitrateMbps_ = bitrateMbps;
 }

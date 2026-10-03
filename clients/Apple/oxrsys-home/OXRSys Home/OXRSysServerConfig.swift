@@ -40,7 +40,7 @@ struct OXRSysServerConfig: Equatable {
     runtime_enabled = true
 
     [streaming]
-    # H.265 encoding bitrate in Mbps. Lower = less latency but more artifacts.
+    # PyroWave encoding bitrate in Mbps; each frame is held to bitrate_mbps / refresh_rate_hz bytes.
     # Try 20-30 for lower latency, 50+ for quality.
     bitrate_mbps = 50
 

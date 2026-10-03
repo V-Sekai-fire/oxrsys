@@ -382,6 +382,13 @@ if(NOT OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED MATCHES "^(AUTO|ON|OFF)$")
     message(FATAL_ERROR "OXRSYS_BUILD_QT_FRONTENDS must be AUTO, ON, or OFF")
 endif()
 
+# The Qt frontends decode with PyroWave's Vulkan C API, which Apple builds do not compile.
+if(APPLE AND OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED STREQUAL "ON")
+    message(FATAL_ERROR "OXRSYS_BUILD_QT_FRONTENDS=ON is not supported on Apple platforms: "
+        "the Qt frontends decode PyroWave through its Vulkan C API, which is built only on "
+        "Windows and Linux. Use the SwiftUI Home and simulator apps under clients/Apple.")
+endif()
+
 set(OXRSYS_QT_FRONTENDS_ENABLED OFF)
 if(OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED STREQUAL "ON")
     set(OXRSYS_QT_FRONTENDS_ENABLED ON)

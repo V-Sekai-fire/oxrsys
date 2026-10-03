@@ -27,7 +27,7 @@ stream resolution over USB TCP through protocol v1.2 `StreamConfigUpdate/Ack` wh
 supports it, without resizing the OpenXR application's swapchains, and the passthrough feature can keep Quest passthrough
 active during negotiated MR streaming while local shell GL resources are released.
 Runtime video sends now run behind a
-bounded encoded-frame sender queue so socket backpressure does not run inside VideoToolbox callbacks,
+bounded encoded-frame sender queue so socket backpressure does not run inside the encoder's completion callbacks,
 the Quest client drains MediaCodec output off the XR frame loop, and the runtime ABR controller
 uses client latency, displayed frame age, keyframe requests, send/encoder drops, and reprojection
 pressure to adjust bitrate with sliding windows and hysteresis. The visionOS
@@ -66,7 +66,7 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is fully gr
 - **Always build and verify before declaring success** — run the macOS build + tests and/or Android build as appropriate before saying everything works
 - **Always update `README.md`, `AGENTS.md`, and the relevant files in `docs/` when making significant project changes**
 - Keep SwiftUI Home and Qt Home companion behavior in sync when changing shared Home workflows; only diverge for frontend-specific changes or when the user explicitly asks for a feature to be limited to one frontend.
-- Core C++ dependencies, including PyroWave's C API and its Granite subset, which the Windows and Linux runtimes and the Qt simulator stream with, and PyroWave's Metal port the macOS runtime can encode with, are fetched via CMake FetchContent (the Apple simulator's `CPyroWave` target is a copy of the PyroWave decoder at the same commit, since Swift packages cannot fetch it); Qt, Vulkan SDKs, and platform SDKs are system/toolchain dependencies. Nothing links FFmpeg.
+- Core C++ dependencies, including PyroWave's C API and its Granite subset, which the Windows and Linux runtimes and the Qt simulator stream with, and PyroWave's Metal port the macOS runtime encodes with, are fetched via CMake FetchContent (the Apple simulator's `CPyroWave` target is a copy of the PyroWave decoder at the same commit, since Swift packages cannot fetch it); Qt, Vulkan SDKs, and platform SDKs are system/toolchain dependencies. Nothing links FFmpeg.
 - Product versions are centralized in `config/OXRSysVersion.xcconfig`; do not hardcode
   marketing versions or build numbers in CMake, Xcode, Gradle, or native client code.
 - Commit messages must read naturally and must not mention Codex or include `[codex]`.
@@ -96,7 +96,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Metal streaming must snapshot dynamic swapchain images through the app-provided command queue and GPU-side shared-event waits; if no staging slot is safe to reuse, drop that streaming frame instead of reading a live reused swapchain slot.
 - Quest USB streaming uses reconnecting ADB reverse TCP on localhost ports `9944`, `9945`, `9946`, and the reserved reliable spatial port `9948`; app-level Android USB permission dialogs are only for `UsbManager`-visible devices and are not required for ADB reverse streaming.
 - Home USB setup should prefer the native ADB host-server protocol on `127.0.0.1:5037` when available, fall back to a selected or auto-detected `adb` executable only when needed, and configure missing reverse mappings automatically when the user selects USB.
-- Quest USB TCP sockets must keep bounded send behavior; failed video sends must clear stale TCP dispatch state and must not block the encoded-frame sender, VideoToolbox callback, or `Session::EndFrame()`.
+- Quest USB TCP sockets must keep bounded send behavior; failed video sends must clear stale TCP dispatch state and must not block the encoded-frame sender, the encoder's completion callback, or `Session::EndFrame()`.
 - Encoded video dispatch is latest-frame-oriented and bounded; stale queued frames may be dropped instead of building latency when the transport cannot keep up.
 - Runtime-managed Quest logcat capture is optional and disabled by default; if enabled, clearing the headset log before capture must remain bounded/best-effort and must not block runtime startup or tests.
 - Headset refresh rate is selected by the server config/Home, requested by the Quest client through `XR_FB_display_refresh_rate`, and negotiated back from the active client rate.
@@ -105,7 +105,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Headset clients must match `VIDEO_FLAG_RENDER_POSE` metadata to the decoded frame before projection submission.
 - Quest client reprojection must stay bounded: use exact render-pose matches first, only fall back to recent monotone render poses, disable image-space pose warp on old frames, strong translation, missing pose, recovery, or repeated stale reuse, and keep all work on the GLES/EGL GPU path.
 - ABR must avoid oscillation: lower bitrate quickly on latency/loss/reprojection pressure, recover slowly through hysteresis, and do not raise bitrate/resolution while displayed frame age or reprojection pressure is high. Dynamic resolution only changes the encoded streaming size, never the OpenXR application's swapchain size, and live decoder reconfiguration is limited to reliable USB TCP until WiFi has a safe reliable control path.
-- Server-side foveated encoding uses the ALVR-style AADT transform on the async Metal encode path only; write AADT output through a Metal compute pass into a private GPU scratch texture before blitting into VideoToolbox pixel buffers, keep it fail-closed when layout/source dimensions are not coherent, and do not send distorted video to clients without `CLIENT_CAPABILITY_FOVEATED_ENCODING`.
+- Server-side foveated encoding uses the ALVR-style AADT transform on the async Metal encode path only; write AADT output through a Metal compute pass into a private GPU scratch texture before blitting into the encoder's BGRA pixel buffers, keep it fail-closed when layout/source dimensions are not coherent, and do not send distorted video to clients without `CLIENT_CAPABILITY_FOVEATED_ENCODING`.
 - Quest shader upscaling and foveated-encoding decompression must preserve render-pose matching and keep the plain bilinear path working when the server flags are off.
 - Quest decoder input buffers must keep bounded headroom above `encodedWidth * encodedHeight`; foveated encoding can shrink encoded dimensions while high-bitrate IDR frames remain large.
 - Headset speaker audio has protocol/config scaffolding only until a real capture/playback path is attached; do not advertise `SERVER_FEATURE_HEADSET_AUDIO` without that pipeline.

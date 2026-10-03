@@ -168,7 +168,7 @@ final class AppModel {
     private let videoReceiver = VideoReceiver()
     private let trackingSender = TrackingSender()
     private let controlChannel = ControlChannel()
-    private let decoder = H265Decoder()
+    private let decoder = PyroWaveDecoder()
     private let latencyReporter = LatencyReporter()
     private let trackingManager = VisionTrackingManager()
     private nonisolated let pixelBufferState = PixelBufferState()
@@ -384,7 +384,7 @@ final class AppModel {
                 presentationTimeNs: presentationTimeNs,
                 receiveTimeNs: receiveTimeNs
             )
-            self.decoder.decode(nalData: nalData, presentationTimeNs: presentationTimeNs)
+            self.decoder.decode(frameData: nalData, presentationTimeNs: presentationTimeNs)
         }, onRenderPose: { [weak self] presentationTimeNs, orientation in
             let quat = simd_quatf(ix: orientation.0, iy: orientation.1, iz: orientation.2, r: orientation.3)
             self?.renderPoseReprojector.note(presentationTimeNs: presentationTimeNs, orientation: quat)
