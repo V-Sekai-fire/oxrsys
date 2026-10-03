@@ -35,7 +35,7 @@ namespace oxr
  * Manages the OpenXR session lifecycle on the headset:
  * - Creates XrInstance with EGL/OpenGL ES, XrSession, XrSwapchains
  * - Discovers the macOS server via UDP broadcast
- * - Receives H.265 video frames, decodes, and blits to swapchains
+ * - Receives PyroWave video frames, decodes, and blits to swapchains
  * - Sends head/controller tracking data back to the server
  */
 class XrApp
@@ -225,7 +225,7 @@ private:
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
 
     // Video rendering (GL resources)
-    GLuint videoTexture_ = 0;       // GL_TEXTURE_EXTERNAL_OES for decoded video
+    GLuint videoTextures_[VideoDecoder::PlaneCount] = {}; // Y, Cb, Cr planes of the decoded frame
     GLuint blitProgram_ = 0;
     GLuint blitVao_ = 0;
     GLuint blitVbo_ = 0;
@@ -233,7 +233,6 @@ private:
     GLuint shellVao_ = 0;
     GLuint shellVbo_ = 0;
     GLuint fbo_ = 0;               // Framebuffer for blit-to-swapchain
-    GLint blitTextureUniform_ = -1;
     GLint blitEyeSourceMinUniform_ = -1;
     GLint blitEyeSourceMaxUniform_ = -1;
     GLint blitLogicalTexelSizeUniform_ = -1;

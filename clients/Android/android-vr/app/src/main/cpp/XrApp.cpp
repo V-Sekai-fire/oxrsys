@@ -86,12 +86,13 @@ constexpr uint32_t kUsbAdbRetryLogInterval = 10;
 
 // Foveated decompression follows ALVR's AADT inverse mapping (MIT licensed).
 // The upscaling branch is an OXRSys edge-aware shader path using ALVR's public defaults.
-static const char* BLIT_FRAGMENT_SHADER_OES = R"(#version 300 es
-#extension GL_OES_EGL_image_external_essl3 : require
+static const char* BLIT_FRAGMENT_SHADER_YUV420 = R"(#version 300 es
 precision highp float;
 in vec2 vUV;
 out vec4 fragColor;
-uniform samplerExternalOES uTexture;
+uniform sampler2D uTextureY;
+uniform sampler2D uTextureCb;
+uniform sampler2D uTextureCr;
 uniform vec2 uEyeSourceMin;
 uniform vec2 uEyeSourceMax;
 uniform vec2 uLogicalTexelSize;
@@ -158,8 +159,15 @@ vec2 mapEyeUvToSource(vec2 eyeUv) {
     return mix(uEyeSourceMin, uEyeSourceMax, corrected);
 }
 
+// Full-range BT.709 with chroma centred on 128, as the runtime's PyroWave encode writes it.
 vec3 sampleVideo(vec2 eyeUv) {
-    return texture(uTexture, mapEyeUvToSource(clamp(eyeUv, vec2(0.0), vec2(1.0)))).rgb;
+    vec2 uv = mapEyeUvToSource(clamp(eyeUv, vec2(0.0), vec2(1.0)));
+    float y = texture(uTextureY, uv).r;
+    float cb = texture(uTextureCb, uv).r - 128.0 / 255.0;
+    float cr = texture(uTextureCr, uv).r - 128.0 / 255.0;
+    return clamp(vec3(y + 1.5748 * cr,
+                      y - 0.1873 * cb - 0.4681 * cr,
+                      y + 1.8556 * cb), vec3(0.0), vec3(1.0));
 }
 
 float luma(vec3 color) {
@@ -416,7 +424,7 @@ static bool IsNearlyFullExtent(uint32_t fullExtent, int32_t croppedExtent)
         return false;
     }
 
-    // MediaCodec may report a tiny conformance/alignment crop (a few pixels).
+    // A decoder may report a tiny conformance/alignment crop (a few pixels).
     // That is safe to honor. Large crops tend to describe decoder internals or
     // memory layout rather than the visible GL texture domain, which would make
     // us zoom into a quarter of the frame when resolution_scale < 1.
@@ -1855,14 +1863,14 @@ bool XrApp::CreateSwapchains()
         LOGI("Eye %d swapchain: %ux%u, %u images", eye, swapchainWidth_, swapchainHeight_, imageCount);
     }
 
-    // Create GL resources for video blit (uses samplerExternalOES for GPU YUV→RGB)
-    blitProgram_ = CreateBlitProgram(BLIT_FRAGMENT_SHADER_OES);
+    // Create GL resources for video blit (samples the Y, Cb and Cr planes and converts to RGB)
+    blitProgram_ = CreateBlitProgram(BLIT_FRAGMENT_SHADER_YUV420);
     if (blitProgram_ == 0)
     {
-        LOGE("Failed to create blit shader program with external OES sampler");
+        LOGE("Failed to create blit shader program with YUV 4:2:0 samplers");
         return false;
     }
-    blitTextureUniform_ = glGetUniformLocation(blitProgram_, "uTexture");
+    const char* planeSamplers[VideoDecoder::PlaneCount] = {"uTextureY", "uTextureCb", "uTextureCr"};
     blitEyeSourceMinUniform_ = glGetUniformLocation(blitProgram_, "uEyeSourceMin");
     blitEyeSourceMaxUniform_ = glGetUniformLocation(blitProgram_, "uEyeSourceMax");
     blitLogicalTexelSizeUniform_ = glGetUniformLocation(blitProgram_, "uLogicalTexelSize");
@@ -1889,7 +1897,10 @@ bool XrApp::CreateSwapchains()
         glGetUniformLocation(blitProgram_, "uPassthroughAlphaEnabled");
 
     glUseProgram(blitProgram_);
-    glUniform1i(blitTextureUniform_, 0);
+    for (uint32_t i = 0; i < VideoDecoder::PlaneCount; ++i)
+    {
+        glUniform1i(glGetUniformLocation(blitProgram_, planeSamplers[i]), static_cast<GLint>(i));
+    }
     glUniform1f(blitUpscaleEdgeThresholdUniform_, 4.0f / 255.0f);
     glUniform1f(blitUpscaleSharpnessUniform_, 2.0f);
     glUniform1i(blitReprojectionWarpEnabledUniform_, 0);
@@ -1921,17 +1932,19 @@ bool XrApp::CreateSwapchains()
 
     glGenFramebuffers(1, &fbo_);
 
-    // Create video texture as GL_TEXTURE_EXTERNAL_OES
-    // (bound to decoded video frames via EGLImage from AHardwareBuffer)
-    glGenTextures(1, &videoTexture_);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    // One texture per decoded plane, bound to the plane's AHardwareBuffer through an EGLImage
+    glGenTextures(VideoDecoder::PlaneCount, videoTextures_);
+    for (GLuint texture : videoTextures_)
+    {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
 
-    LOGI("GL resources created for video rendering (external OES texture)");
+    LOGI("GL resources created for video rendering (Y, Cb, Cr plane textures)");
 
     if (!CreateShellResources())
     {
@@ -2619,7 +2632,7 @@ void XrApp::ConfigureServerConnection(const protocol::ServerAnnounce& server,
     if (videoDecoder_ && !videoDecoder_->IsInitialized())
     {
         std::lock_guard<std::mutex> decoderLock(videoDecoderMutex_);
-        if (videoDecoder_->Initialize(decoderWidth, decoderHeight))
+        if (videoDecoder_->Initialize(decoderWidth, decoderHeight, eglDisplay_))
         {
             LOGI("Video decoder initialized: %ux%u (encoded), render %ux%u",
                  decoderWidth, decoderHeight, videoWidth_, videoHeight_);
@@ -2729,7 +2742,7 @@ void XrApp::SendClientConnect(const char* serverIp)
     connect.type = protocol::MessageType::ClientConnect;
     connect.versionMajor = 1;
     connect.versionMinor = 2;
-    connect.preferredCodec = static_cast<uint32_t>(protocol::VideoCodec::H265);
+    connect.preferredCodec = static_cast<uint32_t>(protocol::VideoCodec::PyroWave);
     connect.maxBitrateMbps = usbAdb
         ? protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG
         : 100;
@@ -2986,7 +2999,7 @@ void XrApp::StreamConfigWorkerMain()
             if (videoDecoder_)
             {
                 videoDecoder_->Shutdown();
-                accepted = videoDecoder_->Initialize(update.encodedWidth, update.encodedHeight);
+                accepted = videoDecoder_->Initialize(update.encodedWidth, update.encodedHeight, eglDisplay_);
             }
         }
 
@@ -3402,40 +3415,24 @@ void XrApp::OnNalUnitReceived(const uint8_t* data, size_t size,
 
     if (nalUnitsReceived_ <= 10 || nalUnitsReceived_ % 300 == 0)
     {
-        // Log NAL unit type for H.265 (type is in bits 1-6 of second byte after start code)
-        const char* nalType = "unknown";
-        if (size > 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
-        {
-            uint8_t nalTypeId = (data[4] >> 1) & 0x3F;
-            switch (nalTypeId)
-            {
-                case 32: nalType = "VPS"; break;
-                case 33: nalType = "SPS"; break;
-                case 34: nalType = "PPS"; break;
-                case 19: case 20: nalType = "IDR"; break;
-                case 1: nalType = "P-slice"; break;
-                default: nalType = "other"; break;
-            }
-        }
-        LOGI("NAL unit #%u: size=%zu type=%s ts=%lld",
-             nalUnitsReceived_, size, nalType, (long long)timestampNs);
+        LOGI("Video frame #%u: size=%zu ts=%lld", nalUnitsReceived_, size, (long long)timestampNs);
     }
 
     std::lock_guard<std::mutex> decoderLock(videoDecoderMutex_);
     if (videoDecoder_ && videoDecoder_->IsInitialized())
     {
         const bool alphaBlend = (flags & protocol::VIDEO_FLAG_ALPHA_BLEND) != 0;
-        bool submitted = videoDecoder_->SubmitNalUnit(
+        bool submitted = videoDecoder_->SubmitFrame(
             data, size, timestampNs / 1000, receiveTimeNs, alphaBlend);
         if (!submitted && nalUnitsReceived_ <= 10)
         {
-            LOGW("Failed to submit NAL unit #%u to decoder (no input buffer available)",
+            LOGW("Failed to submit video frame #%u to the decoder (no sequence header or size mismatch)",
                  nalUnitsReceived_);
         }
     }
     else if (nalUnitsReceived_ <= 5)
     {
-        LOGW("NAL unit received but decoder not initialized");
+        LOGW("Video frame received but decoder not initialized");
     }
 }
 
@@ -3742,9 +3739,8 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
             decodedFrameCount_++;
             if (decodedFrameCount_ <= 5 || decodedFrameCount_ % 300 == 0)
             {
-                LOGI("Decoded frame #%u: pts=%lld hwBuffer=%p",
-                     decodedFrameCount_, (long long)frame.presentationTimeUs,
-                     (void*)frame.hardwareBuffer);
+                LOGI("Decoded frame #%u: pts=%lld",
+                     decodedFrameCount_, (long long)frame.presentationTimeUs);
             }
 
             lastFrameReceiveTimeNs_ = frame.localReceiveTimeNs;
@@ -3791,128 +3787,123 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
                     (double)(frame.localAcquireTimeNs - frame.localSubmitTimeNs) / 1.0e6);
             }
 
-            // Import AHardwareBuffer as EGLImage and bind to GL_TEXTURE_EXTERNAL_OES.
-            // The GPU handles YUV→RGB conversion natively — zero CPU copy.
-            if (frame.hardwareBuffer != nullptr)
+            // Bind each decoded plane's AHardwareBuffer to its texture through an EGLImage.
+            // The decoder waited for Vulkan to finish writing the planes before handing them over.
             {
-                EGLClientBuffer clientBuf =
-                    eglGetNativeClientBufferANDROID_(frame.hardwareBuffer);
-
-                if (clientBuf != nullptr)
+                bool bound = true;
+                for (uint32_t plane = 0; plane < VideoDecoder::PlaneCount; ++plane)
                 {
+                    EGLClientBuffer clientBuf = eglGetNativeClientBufferANDROID_(frame.planes[plane]);
                     EGLint imageAttribs[] = {
                         EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
                         EGL_NONE
                     };
-
-                    EGLImageKHR eglImage = eglCreateImageKHR_(
-                        eglDisplay_, EGL_NO_CONTEXT,
-                        EGL_NATIVE_BUFFER_ANDROID,
-                        clientBuf, imageAttribs);
-
-                    if (eglImage != EGL_NO_IMAGE_KHR)
+                    EGLImageKHR eglImage = clientBuf == nullptr
+                        ? EGL_NO_IMAGE_KHR
+                        : eglCreateImageKHR_(eglDisplay_, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                                             clientBuf, imageAttribs);
+                    if (eglImage == EGL_NO_IMAGE_KHR)
                     {
-                        glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
-                        glEGLImageTargetTexture2DOES_(GL_TEXTURE_EXTERNAL_OES, eglImage);
-                        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
-
-                        uint32_t sampleWidth = frame.bufferWidth;
-                        uint32_t sampleHeight = frame.bufferHeight;
-                        if (sampleWidth == 0)
+                        bound = false;
+                        if (decodedFrameCount_ <= 5)
                         {
-                            sampleWidth = 1;
+                            LOGE("EGLImage for plane %u failed: 0x%x", plane, eglGetError());
                         }
-                        if (sampleHeight == 0)
-                        {
-                            sampleHeight = 1;
-                        }
-
-                        uint32_t visibleWidth = frame.bufferWidth > 0 ? frame.bufferWidth : sampleWidth;
-                        uint32_t visibleHeight = frame.bufferHeight > 0 ? frame.bufferHeight : sampleHeight;
-
-                        int32_t cropLeft = 0;
-                        int32_t cropRight = static_cast<int32_t>(visibleWidth);
-                        int32_t cropTop = 0;
-                        int32_t cropBottom = static_cast<int32_t>(visibleHeight);
-
-                        int32_t requestedCropWidth = frame.cropRight - frame.cropLeft;
-                        int32_t requestedCropHeight = frame.cropBottom - frame.cropTop;
-                        bool useCropWidth = IsNearlyFullExtent(visibleWidth, requestedCropWidth);
-                        bool useCropHeight = IsNearlyFullExtent(visibleHeight, requestedCropHeight);
-
-                        if (useCropWidth)
-                        {
-                            cropLeft = std::clamp(frame.cropLeft, 0, (int32_t)visibleWidth - 1);
-                            cropRight = std::clamp(frame.cropRight, cropLeft + 1,
-                                                  (int32_t)visibleWidth);
-                        }
-
-                        if (useCropHeight)
-                        {
-                            cropTop = std::clamp(frame.cropTop, 0, (int32_t)visibleHeight - 1);
-                            cropBottom = std::clamp(frame.cropBottom, cropTop + 1,
-                                                   (int32_t)visibleHeight);
-                        }
-
-                        videoContentUMin_ = ClampNormalized(
-                            static_cast<float>(cropLeft) / static_cast<float>(sampleWidth));
-                        videoContentUMax_ = ClampNormalized(
-                            static_cast<float>(cropRight) / static_cast<float>(sampleWidth));
-                        videoContentVMin_ = ClampNormalized(
-                            static_cast<float>(cropTop) / static_cast<float>(sampleHeight));
-                        videoContentVMax_ = ClampNormalized(
-                            static_cast<float>(cropBottom) / static_cast<float>(sampleHeight));
-
-                        hasVideo = true;
-                        hasVideoTexture_ = true;
-                        lastVideoFrameTime_ = std::chrono::steady_clock::now();
-                        presentedVideoFrame_.valid = true;
-                        presentedVideoFrame_.texture = videoTexture_;
-                        presentedVideoFrame_.presentationTimeUs = frame.presentationTimeUs;
-                        presentedVideoFrame_.localReceiveTimeNs = frame.localReceiveTimeNs;
-                        presentedVideoFrame_.localSubmitTimeNs = frame.localSubmitTimeNs;
-                        presentedVideoFrame_.localAcquireTimeNs = frame.localAcquireTimeNs;
-                        presentedVideoFrame_.renderPose = matchedRenderPose;
-                        presentedVideoFrame_.hasRenderPose = hasMatchedRenderPose;
-                        presentedVideoFrame_.alphaBlend = frame.alphaBlend;
-                        if (frame.alphaBlend && !hasObservedProtocolAlphaFrame_)
-                        {
-                            LOGI("First alpha-blend video frame received");
-                        }
-                        hasObservedProtocolAlphaFrame_ =
-                            hasObservedProtocolAlphaFrame_ || frame.alphaBlend;
-                        presentedVideoFrame_.headsetPoseAtPresentation = BuildCurrentHeadPose();
-                        presentedVideoFrame_.consecutiveReuses = 0;
-                        (void)usedRenderPoseFallback;
-
-                        if (decodedFrameCount_ <= 5 || decodedFrameCount_ % 300 == 0)
-                        {
-                            LOGI("Video content UVs: u=[%.5f, %.5f] v=[%.5f, %.5f] "
-                                 "(buffer=%ux%u stride=%u crop=[%d,%d - %d,%d] useCrop=%d/%d)",
-                                 videoContentUMin_, videoContentUMax_,
-                                 videoContentVMin_, videoContentVMax_,
-                                 frame.bufferWidth, frame.bufferHeight, frame.bufferStride,
-                                 frame.cropLeft, frame.cropTop, frame.cropRight, frame.cropBottom,
-                                 useCropWidth ? 1 : 0, useCropHeight ? 1 : 0);
-                        }
-
-                        // EGLImage can be destroyed after binding — texture retains the reference
-                        eglDestroyImageKHR_(eglDisplay_, eglImage);
+                        break;
                     }
-                    else if (decodedFrameCount_ <= 5)
-                    {
-                        LOGE("eglCreateImageKHR failed: 0x%x", eglGetError());
-                    }
+                    glBindTexture(GL_TEXTURE_2D, videoTextures_[plane]);
+                    glEGLImageTargetTexture2DOES_(GL_TEXTURE_2D, eglImage);
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                    // The texture keeps the buffer; the EGLImage is no longer needed.
+                    eglDestroyImageKHR_(eglDisplay_, eglImage);
                 }
-                else if (decodedFrameCount_ <= 5)
+
+                if (bound)
                 {
-                    LOGE("eglGetNativeClientBufferANDROID failed");
+                    uint32_t sampleWidth = frame.bufferWidth;
+                    uint32_t sampleHeight = frame.bufferHeight;
+                    if (sampleWidth == 0)
+                    {
+                        sampleWidth = 1;
+                    }
+                    if (sampleHeight == 0)
+                    {
+                        sampleHeight = 1;
+                    }
+
+                    uint32_t visibleWidth = frame.bufferWidth > 0 ? frame.bufferWidth : sampleWidth;
+                    uint32_t visibleHeight = frame.bufferHeight > 0 ? frame.bufferHeight : sampleHeight;
+
+                    int32_t cropLeft = 0;
+                    int32_t cropRight = static_cast<int32_t>(visibleWidth);
+                    int32_t cropTop = 0;
+                    int32_t cropBottom = static_cast<int32_t>(visibleHeight);
+
+                    int32_t requestedCropWidth = frame.cropRight - frame.cropLeft;
+                    int32_t requestedCropHeight = frame.cropBottom - frame.cropTop;
+                    bool useCropWidth = IsNearlyFullExtent(visibleWidth, requestedCropWidth);
+                    bool useCropHeight = IsNearlyFullExtent(visibleHeight, requestedCropHeight);
+
+                    if (useCropWidth)
+                    {
+                        cropLeft = std::clamp(frame.cropLeft, 0, (int32_t)visibleWidth - 1);
+                        cropRight = std::clamp(frame.cropRight, cropLeft + 1,
+                                              (int32_t)visibleWidth);
+                    }
+
+                    if (useCropHeight)
+                    {
+                        cropTop = std::clamp(frame.cropTop, 0, (int32_t)visibleHeight - 1);
+                        cropBottom = std::clamp(frame.cropBottom, cropTop + 1,
+                                               (int32_t)visibleHeight);
+                    }
+
+                    videoContentUMin_ = ClampNormalized(
+                        static_cast<float>(cropLeft) / static_cast<float>(sampleWidth));
+                    videoContentUMax_ = ClampNormalized(
+                        static_cast<float>(cropRight) / static_cast<float>(sampleWidth));
+                    videoContentVMin_ = ClampNormalized(
+                        static_cast<float>(cropTop) / static_cast<float>(sampleHeight));
+                    videoContentVMax_ = ClampNormalized(
+                        static_cast<float>(cropBottom) / static_cast<float>(sampleHeight));
+
+                    hasVideo = true;
+                    hasVideoTexture_ = true;
+                    lastVideoFrameTime_ = std::chrono::steady_clock::now();
+                    presentedVideoFrame_.valid = true;
+                    presentedVideoFrame_.texture = videoTextures_[0];
+                    presentedVideoFrame_.presentationTimeUs = frame.presentationTimeUs;
+                    presentedVideoFrame_.localReceiveTimeNs = frame.localReceiveTimeNs;
+                    presentedVideoFrame_.localSubmitTimeNs = frame.localSubmitTimeNs;
+                    presentedVideoFrame_.localAcquireTimeNs = frame.localAcquireTimeNs;
+                    presentedVideoFrame_.renderPose = matchedRenderPose;
+                    presentedVideoFrame_.hasRenderPose = hasMatchedRenderPose;
+                    presentedVideoFrame_.alphaBlend = frame.alphaBlend;
+                    if (frame.alphaBlend && !hasObservedProtocolAlphaFrame_)
+                    {
+                        LOGI("First alpha-blend video frame received");
+                    }
+                    hasObservedProtocolAlphaFrame_ =
+                        hasObservedProtocolAlphaFrame_ || frame.alphaBlend;
+                    presentedVideoFrame_.headsetPoseAtPresentation = BuildCurrentHeadPose();
+                    presentedVideoFrame_.consecutiveReuses = 0;
+                    (void)usedRenderPoseFallback;
+
+                    if (decodedFrameCount_ <= 5 || decodedFrameCount_ % 300 == 0)
+                    {
+                        LOGI("Video content UVs: u=[%.5f, %.5f] v=[%.5f, %.5f] "
+                             "(buffer=%ux%u stride=%u crop=[%d,%d - %d,%d] useCrop=%d/%d)",
+                             videoContentUMin_, videoContentUMax_,
+                             videoContentVMin_, videoContentVMax_,
+                             frame.bufferWidth, frame.bufferHeight, frame.bufferStride,
+                             frame.cropLeft, frame.cropTop, frame.cropRight, frame.cropBottom,
+                             useCropWidth ? 1 : 0, useCropHeight ? 1 : 0);
+                    }
+
                 }
             }
 
-            // DON'T call ReleaseFrame() here — keep the AImage/AHardwareBuffer alive
-            // until next AcquireFrame(), so the texture data remains valid during rendering.
-            // AcquireFrame() automatically releases the previous image.
+            // The decoder leaves these planes unwritten until GL has finished with them.
         }
         else if (hasVideoTexture_)
         {
@@ -3928,7 +3919,7 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
             }
             else
             {
-                // Reuse the last frame — the AHardwareBuffer is still alive (not released).
+                // Reuse the last frame; the decoder keeps its planes until the next acquire.
                 if (presentedVideoFrame_.valid)
                 {
                     hasVideo = true;
@@ -4068,7 +4059,12 @@ void XrApp::BlitVideoToSwapchain(int eye)
 
     glUseProgram(blitProgram_);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
+    for (uint32_t i = 0; i < VideoDecoder::PlaneCount; ++i)
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, videoTextures_[i]);
+    }
+    glActiveTexture(GL_TEXTURE0);
     glUniform2f(blitEyeSourceMinUniform_, uMin, contentVMin);
     glUniform2f(blitEyeSourceMaxUniform_, uMax, contentVMax);
     glUniform2f(blitLogicalTexelSizeUniform_, decodedTexelWidth_ * 2.0f, decodedTexelHeight_);
@@ -5162,7 +5158,6 @@ void XrApp::Shutdown()
     {
         glDeleteProgram(blitProgram_);
         blitProgram_ = 0;
-        blitTextureUniform_ = -1;
         blitEyeSourceMinUniform_ = -1;
         blitEyeSourceMaxUniform_ = -1;
         blitLogicalTexelSizeUniform_ = -1;
@@ -5195,10 +5190,13 @@ void XrApp::Shutdown()
         glDeleteFramebuffers(1, &fbo_);
         fbo_ = 0;
     }
-    if (videoTexture_ != 0)
+    if (videoTextures_[0] != 0)
     {
-        glDeleteTextures(1, &videoTexture_);
-        videoTexture_ = 0;
+        glDeleteTextures(VideoDecoder::PlaneCount, videoTextures_);
+        for (GLuint& texture : videoTextures_)
+        {
+            texture = 0;
+        }
     }
 
     // Destroy swapchains

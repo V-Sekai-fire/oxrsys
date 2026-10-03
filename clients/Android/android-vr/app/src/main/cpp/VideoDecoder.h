@@ -2,52 +2,50 @@
 
 #pragma once
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <media/NdkMediaCodec.h>
-#include <media/NdkImage.h>
-#include <media/NdkImageReader.h>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
-struct ANativeWindow;
 struct AHardwareBuffer;
 
 namespace oxr
 {
 
 /**
- * Hardware H.265 video decoder using Android MediaCodec.
+ * PyroWave decoder on a Vulkan device of its own.
  *
- * Receives NAL units from the network, feeds them to the hardware decoder,
- * and outputs decoded frames via AImageReader → AHardwareBuffer for zero-copy
- * GPU rendering via EGLImage + GL_TEXTURE_EXTERNAL_OES.
- *
- * CPU-based YUV plane access doesn't work on Quest (Qualcomm UBWC format),
- * so we use the GPU path which handles all proprietary YUV layouts natively.
+ * A decode thread decodes the newest submitted frame into three R8 planes (Y, Cb, Cr) backed by
+ * AHardwareBuffers and waits for the GPU before publishing them, so the GLES renderer can import
+ * the planes as EGLImages and sample them with no further synchronisation.
  */
 class VideoDecoder
 {
 public:
-    VideoDecoder() = default;
+    static constexpr uint32_t PlaneCount = 3;
+
+    VideoDecoder();
     ~VideoDecoder();
 
-    // Non-copyable
     VideoDecoder(const VideoDecoder&) = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;
 
-    bool Initialize(uint32_t width, uint32_t height);
+    bool Initialize(uint32_t width, uint32_t height, EGLDisplay display);
     void Shutdown();
 
-    // Feed an H.265 NAL unit to the decoder
-    bool SubmitNalUnit(const uint8_t* data, size_t size, int64_t presentationTimeUs,
-                       int64_t receiveTimeNs, bool alphaBlend);
+    // Queues one PyroWave frame; a frame not yet decoded is replaced by a newer one.
+    bool SubmitFrame(const uint8_t* data, size_t size, int64_t presentationTimeUs,
+                     int64_t receiveTimeNs, bool alphaBlend);
 
-    // Decoded frame providing an AHardwareBuffer for GPU rendering
     struct DecodedFrame
     {
-        AHardwareBuffer* hardwareBuffer = nullptr;
+        AHardwareBuffer* planes[PlaneCount] = {};
         int64_t presentationTimeUs = 0;
         uint32_t bufferWidth = 0;
         uint32_t bufferHeight = 0;
@@ -63,19 +61,23 @@ public:
         bool alphaBlend = false;
     };
 
-    // Get the next decoded frame (returns false if no frame ready).
-    // The AHardwareBuffer is valid until ReleaseFrame() is called.
+    // Called on the GL thread with the context current. The planes stay unwritten until the
+    // GL commands issued before the next successful AcquireFrame have completed.
     bool AcquireFrame(DecodedFrame* outFrame);
-    void ReleaseFrame();
 
-    bool IsInitialized() const { return codec_ != nullptr; }
+    bool IsInitialized() const { return running_.load(); }
 
     uint32_t GetWidth() const { return width_; }
     uint32_t GetHeight() const { return height_; }
     uint32_t GetSkippedFramesBeforeAcquire() const { return skippedFramesBeforeAcquire_.load(); }
 
+    // Width and height from a PyroWave frame's sequence header, or false without one.
+    static bool FrameSize(const uint8_t* data, size_t size, uint32_t* width, uint32_t* height);
+
 private:
-    struct PendingFrameMetadata
+    struct Gpu;
+
+    struct FrameMetadata
     {
         int64_t presentationTimeUs = 0;
         int64_t receiveTimeNs = 0;
@@ -83,25 +85,39 @@ private:
         bool alphaBlend = false;
     };
 
-    // Dequeue all available output buffers and render them to the surface
-    uint32_t FlushOutputToSurface(int64_t timeoutUs);
-    void OutputThreadMain();
-    void RememberSubmittedFrame(int64_t presentationTimeUs, int64_t receiveTimeNs, int64_t submitTimeNs,
-                                bool alphaBlend);
-    bool ConsumeSubmittedFrameMetadata(int64_t presentationTimeUs, PendingFrameMetadata* outMetadata);
+    struct Slot
+    {
+        FrameMetadata metadata;
+        uint32_t skippedBefore = 0;
+        EGLSyncKHR glDone = EGL_NO_SYNC_KHR; // set when the renderer lets go of the slot
+    };
 
-    AMediaCodec* codec_ = nullptr;
-    AImageReader* imageReader_ = nullptr;
-    ANativeWindow* outputWindow_ = nullptr;     // Owned by AImageReader, do not release
-    AImage* currentImage_ = nullptr;
-    std::thread outputThread_;
-    std::atomic<bool> outputThreadRunning_{false};
-    std::atomic<uint32_t> outputFramesReleasedSinceAcquire_{0};
+    static constexpr int SlotCount = 3;
+
+    void DecodeThreadMain();
+    void DestroySyncs();
+
+    std::unique_ptr<Gpu> gpu_;
+    EGLDisplay display_ = EGL_NO_DISPLAY;
+    PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR_ = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR_ = nullptr;
+    PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR_ = nullptr;
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;
-    std::mutex metadataMutex_;
-    std::deque<PendingFrameMetadata> pendingFrames_;
+
+    std::thread decodeThread_;
+    std::atomic<bool> running_{false};
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::vector<uint8_t> pending_;
+    FrameMetadata pendingMetadata_;
+    bool hasPending_ = false;
+    uint32_t pendingReplaced_ = 0;
+
+    Slot slots_[SlotCount];
+    int heldSlot_ = -1;   // sampled by the renderer
+    int readySlot_ = -1;  // decoded, not yet acquired
     std::atomic<uint32_t> skippedFramesBeforeAcquire_{0};
 };
 

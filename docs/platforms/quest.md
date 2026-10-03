@@ -84,7 +84,7 @@ The Android client:
 - requests the server-announced display refresh rate when `XR_FB_display_refresh_rate` is available
 - receives encoded video frames and matches render-pose metadata to each decoded frame before projection submission
 - reuses short decode/network gaps with the configured client reprojection mode
-- drains MediaCodec output on a decoder thread so the XR frame loop only acquires the latest ready image
+- decodes PyroWave on a Vulkan device of its own, on a decoder thread, into Y, Cb and Cr planes in `AHardwareBuffer`s that the GLES renderer samples through EGLImages, so the XR frame loop only acquires the latest ready plane set
 - shows a local shell before video arrives, with status text, a reset button, a passthrough/3D toggle, controller laser interaction, hand laser/pinch interaction, and simple controller/hand-joint markers
 - sends head, controller, and optional hand-tracking data back to the runtime
 - reports latency measurements
@@ -165,9 +165,9 @@ encoder drops, and reprojection pressure. It lowers bitrate quickly on constrain
 and increases slowly after stable windows so WiFi does not oscillate between quality and recovery.
 
 Foveated encoding can reduce the encoded dimensions substantially without reducing the configured
-bitrate by the same ratio. The Android decoder therefore keeps a bounded input-buffer margin instead
-of sizing MediaCodec input buffers only from `encodedWidth * encodedHeight`, so high-bitrate IDR
-frames still fit when foveated encoding is active.
+bitrate by the same ratio. The Android decoder copies each whole frame into a buffer of its own size,
+so a high-bitrate frame fits however small the encoded dimensions are; a frame whose PyroWave sequence
+header names a size other than the decoder's is dropped until the stream reconfiguration arrives.
 
 If a server is discovered but no first video frame arrives, the client treats the session as lost and
 returns to the normal discovery/retry loop rather than staying on the standby/loading color screen.
@@ -235,7 +235,7 @@ The Quest client sends `ClientConnect.maxBitrateMbps = 0` on USB ADB, so USB qua
 
 The runtime configures accepted USB TCP sockets with `TCP_NODELAY`, `SO_NOSIGPIPE` where available, and a bounded send timeout. Encoded video is handed to a bounded sender queue before TCP writes, so socket backpressure cannot run inside the VideoToolbox callback. If a TCP video send fails or times out, the runtime disables the stale TCP video dispatch path and the Android client can reconnect through its existing retry loop. The client also keeps USB tracking TCP sends best-effort/non-blocking so tracking backpressure does not stall the XR frame.
 
-USB TCP sends full H.265 NAL records and render-pose records, so UDP FEC and NACK recovery are disabled on this path.
+USB TCP sends whole PyroWave frame records and render-pose records, so UDP FEC and NACK recovery are disabled on this path.
 
 ## Current Status
 

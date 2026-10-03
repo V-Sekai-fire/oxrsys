@@ -21,7 +21,7 @@ namespace oxr
  *
  * Runs a background thread that:
  * 1. Listens for server discovery broadcasts
- * 2. Receives H.265 video packets and reassembles NAL units
+ * 2. Receives video packets and reassembles whole frames
  * 3. Recovers lost packets using FEC parity when possible
  */
 class NetworkReceiver

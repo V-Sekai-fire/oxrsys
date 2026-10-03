@@ -25,6 +25,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(OpenXR)
 
+# ─── PyroWave decoder (Vulkan, through Granite) ─────────────────────────────
+set(OXRSYS_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../..")
+include(${OXRSYS_REPO_ROOT}/cmake/PyroWave.cmake)
+
 # ─── Android native_app_glue ────────────────────────────────────────────────
 # Provided by the NDK — gives us android_app struct and app lifecycle
 set(NATIVE_APP_GLUE_DIR "${ANDROID_NDK}/sources/android/native_app_glue")
@@ -41,7 +45,7 @@ target_link_libraries(native_app_glue PUBLIC
 )
 
 # ─── Shared protocol definitions ────────────────────────────────────────────
-set(OXRSYS_PROTOCOL_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../../common/protocol/include")
+set(OXRSYS_PROTOCOL_INCLUDE_DIR "${OXRSYS_REPO_ROOT}/common/protocol/include")
 
 # ─── Native client library ──────────────────────────────────────────────────
 add_library(oxrsys_android SHARED
@@ -64,11 +68,11 @@ target_link_libraries(oxrsys_android PRIVATE
     -Wl,--whole-archive native_app_glue -Wl,--no-whole-archive
     android
     log
-    mediandk
     nativewindow
     EGL
     GLESv3
     openxr_loader
+    oxrsys_pyrowave
 )
 
 target_compile_definitions(oxrsys_android PRIVATE
