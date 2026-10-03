@@ -4,6 +4,7 @@
 #include "Runtime.h"
 #include "VulkanDispatch.h"
 #include "D3D11Interop.h"
+#include "LinuxVulkanInterop.h"
 
 #include <spdlog/spdlog.h>
 #include <vulkan/vulkan.h>
@@ -221,6 +222,13 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
         }
     }
 
+#if defined(__linux__)
+    if (!LinuxTransitionSwapchainImages(vulkanContext, vkImages_, arraySize_, static_cast<VkFormat>(format_)))
+    {
+        spdlog::warn("OXRSys: swapchain images were not moved to the attachment layout");
+    }
+#endif
+
     Runtime::Get().RegisterHandle(handle_, this);
     spdlog::info("OXRSys: Vulkan swapchain created {}x{} format={} arraySize={} images={}",
                  width_, height_, format_, arraySize_, imageCount_);
@@ -406,18 +414,14 @@ FrameImageSource Swapchain::GetLastReleasedFrameImageSource(uint32_t arrayIndex)
 
 #if defined(_WIN32)
     return Win32StageSwapchainSlice(win32State_, lastReleasedIndex_, arrayIndex);
-#endif
-
-    void* image = reinterpret_cast<void*>(vkImages_[lastReleasedIndex_]);
-    if (image == nullptr)
+#else
+    VkImage image = reinterpret_cast<VkImage>(vkImages_[lastReleasedIndex_]);
+    if (image == VK_NULL_HANDLE)
     {
         return {};
     }
-
-    FrameImageSource source = {};
-    source.api = GraphicsApi::Vulkan;
-    source.image = std::shared_ptr<void>(image, [](void*) {});
-    return source;
+    return LinuxEyeSource(image, arrayIndex, width_, height_, static_cast<VkFormat>(format_));
+#endif
 }
 
 void Swapchain::ReleaseTextureSlice(void* /*textureSlice*/)

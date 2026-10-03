@@ -27,6 +27,7 @@ if(APPLE)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND OXRSYS_RUNTIME_SOURCES
         src/SwapchainVulkan.cpp
+        src/LinuxVulkanInterop.cpp
         src/PyroWaveVideoEncoderLinux.cpp
     )
 elseif(WIN32)

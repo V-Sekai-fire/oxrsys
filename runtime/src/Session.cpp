@@ -10,6 +10,7 @@
 #include "StreamingServer.h"
 #include "Config.h"
 #include "D3D11Interop.h"
+#include "LinuxVulkanInterop.h"
 #ifdef GetCurrentTime
 #undef GetCurrentTime // winbase.h macro; clashes with Session::GetCurrentTime
 #endif
@@ -626,6 +627,14 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
                 return XR_ERROR_LAYER_INVALID;
         }
     }
+
+#if defined(__linux__) && defined(XR_USE_GRAPHICS_API_VULKAN)
+    // Copy both eyes into an exported image on the app's queue, after its rendering of this frame.
+    if (streamFrame && graphicsContext_.api == GraphicsApi::Vulkan)
+    {
+        LinuxPackVulkanFrame(graphicsContext_.vulkan, frameSource);
+    }
+#endif
 
     frameSource.alphaBlend = oxrsys::runtime::IsAlphaFrameForStreaming(
         frameEndInfo->environmentBlendMode, sourceAlphaProjectionLayer);

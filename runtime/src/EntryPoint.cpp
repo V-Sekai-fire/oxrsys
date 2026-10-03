@@ -25,6 +25,7 @@
 #include "RuntimeStatus.h"
 #include "VulkanDispatch.h"
 #include "D3D11Interop.h"
+#include "LinuxVulkanInterop.h"
 
 #include <spdlog/spdlog.h>
 #include <glm/glm.hpp>
@@ -3248,7 +3249,7 @@ static void EnsureMetalDevice()
 
 // --- v1 functions (XR_KHR_vulkan_enable) ---
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 static XrResult WriteExtensionString(const char* extensions, uint32_t bufferCapacityInput,
                                      uint32_t* bufferCountOutput, char* buffer)
 {
@@ -3292,6 +3293,28 @@ static void AppendExtensions(std::vector<const char*>& names, std::vector<std::s
         }
     }
 }
+
+// Enable timeline semaphores on whichever features struct the app chained, or on next.
+static const void* EnableTimelineSemaphores(const void* appNext, VkPhysicalDeviceTimelineSemaphoreFeatures& next)
+{
+    next.timelineSemaphore = VK_TRUE;
+    for (VkBaseOutStructure* feature = reinterpret_cast<VkBaseOutStructure*>(const_cast<void*>(appNext));
+         feature != nullptr; feature = feature->pNext)
+    {
+        if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+        {
+            reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(feature)->timelineSemaphore = VK_TRUE;
+            return appNext;
+        }
+        if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
+        {
+            reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(feature)->timelineSemaphore = VK_TRUE;
+            return appNext;
+        }
+    }
+    next.pNext = const_cast<void*>(appNext);
+    return &next;
+}
 #endif
 
 static XRAPI_ATTR XrResult XRAPI_CALL OxrGetVulkanInstanceExtensionsKHR(
@@ -3310,6 +3333,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetVulkanInstanceExtensionsKHR(
 
 #if defined(_WIN32)
     return WriteExtensionString(kWin32VulkanInstanceExtensions, bufferCapacityInput, bufferCountOutput, buffer);
+#elif defined(__linux__)
+    return WriteExtensionString(kLinuxVulkanInstanceExtensions, bufferCapacityInput, bufferCountOutput, buffer);
 #else
     // No additional instance extensions required from the runtime
     // (Godot/apps handle portability enumeration themselves in the v1 path)
@@ -3342,6 +3367,8 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetVulkanDeviceExtensionsKHR(
 
 #if defined(_WIN32)
     return WriteExtensionString(kWin32VulkanDeviceExtensions, bufferCapacityInput, bufferCountOutput, buffer);
+#elif defined(__linux__)
+    return WriteExtensionString(kLinuxVulkanDeviceExtensions, bufferCapacityInput, bufferCountOutput, buffer);
 #else
     // No additional device extensions required from the runtime
     // (Godot/apps handle portability subset themselves in the v1 path)
@@ -3520,6 +3547,9 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateVulkanInstanceKHR(
 #if defined(_WIN32)
     std::vector<std::string> interopInstanceExtensions;
     AppendExtensions(extensions, interopInstanceExtensions, kWin32VulkanInstanceExtensions);
+#elif defined(__linux__)
+    std::vector<std::string> interopInstanceExtensions;
+    AppendExtensions(extensions, interopInstanceExtensions, kLinuxVulkanInstanceExtensions);
 #endif
     modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     modifiedCreateInfo.ppEnabledExtensionNames = extensions.data();
@@ -3610,26 +3640,20 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateVulkanDeviceKHR(
 
     VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
-    timelineFeatures.timelineSemaphore = VK_TRUE;
-    bool timelineEnabled = false;
-    for (auto* feature = reinterpret_cast<VkBaseOutStructure*>(const_cast<void*>(appDeviceInfo->pNext));
-         feature != nullptr; feature = feature->pNext)
+    modifiedDeviceInfo.pNext = EnableTimelineSemaphores(appDeviceInfo->pNext, timelineFeatures);
+#elif defined(__linux__)
+    // External fd memory and semaphores for the PyroWave encoder (LinuxVulkanInterop.cpp), as far
+    // as the GPU offers them; without them the stream is black rather than the device failing.
+    const std::string linuxDeviceExtensions = LinuxSupportedDeviceExtensions(
+        gVulkanDispatch.instance, createInfo->vulkanPhysicalDevice);
+    std::vector<std::string> interopDeviceExtensions;
+    AppendExtensions(deviceExts, interopDeviceExtensions, linuxDeviceExtensions.c_str());
+
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    if (linuxDeviceExtensions.find("VK_KHR_timeline_semaphore") != std::string::npos)
     {
-        if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
-        {
-            reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(feature)->timelineSemaphore = VK_TRUE;
-            timelineEnabled = true;
-        }
-        else if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
-        {
-            reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(feature)->timelineSemaphore = VK_TRUE;
-            timelineEnabled = true;
-        }
-    }
-    if (!timelineEnabled)
-    {
-        timelineFeatures.pNext = const_cast<void*>(appDeviceInfo->pNext);
-        modifiedDeviceInfo.pNext = &timelineFeatures;
+        modifiedDeviceInfo.pNext = EnableTimelineSemaphores(appDeviceInfo->pNext, timelineFeatures);
     }
 #endif
     modifiedDeviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExts.size());

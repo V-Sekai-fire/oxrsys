@@ -31,7 +31,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Changed
 
-- Changed the Windows and Linux streaming encoder to PyroWave's Vulkan C API (MIT, fetched with FetchContent with its Granite subset and linked statically). Nothing links FFmpeg; frames are intra-only and tagged `VideoCodec::PyroWave`. The Linux encoder sends a black frame until it reads the app's swapchain images.
+- Changed the Windows and Linux streaming encoder to PyroWave's Vulkan C API (MIT, fetched with FetchContent with its Granite subset and linked statically). Nothing links FFmpeg; frames are intra-only and tagged `VideoCodec::PyroWave`. The Linux encoder encodes the app's swapchain images through Vulkan external fd memory and an exported timeline semaphore, and streams black only when the app's device lacks those extensions.
 - Changed the Qt simulator to drop frames only when their packets are lost: parity trailing a delivered frame no longer counts as a drop or asks for a keyframe, and the video socket's receive buffer is set after bind, where it takes effect.
 - Moved the repository toward the OXRSys cross-platform layout, including `clients/Android/android-vr/`, `clients/Apple/common/`, and `clients/Qt/`.
 - Changed the runtime graphics plumbing to use typed `GraphicsContext` and `FrameSource` data across sessions, swapchains, streaming, and encoders.
